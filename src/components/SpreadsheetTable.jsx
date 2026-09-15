@@ -1,37 +1,24 @@
-import { useCallback, useMemo, useRef, useState } from 'react';
-import { AgGridReact } from 'ag-grid-react';
-import 'ag-grid-community/styles/ag-grid.css';
-import 'ag-grid-community/styles/ag-theme-quartz.css';
-import { ClientSideRowModelModule } from 'ag-grid-community';
-import studentsData from '../data/registrData.json';
-import logoUrl from '../assets/ist-logo.png?url';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ContextMenu from './ContextMenu';
 import FilterPanel from './FilterPanel';
 import TrainingPlanModal from './TrainingPlanModal';
 import ImportExcelModal from './ImportExcelModal';
+import ExcelGrid from './ExcelGrid';
 import { getUniqueCourseGroups, generateTrainingPlan } from '../lib/excelGenerator';
 import { rowKey, FIELD_LABELS } from '../lib/importMapping';
+import useFirebaseData from '../lib/useFirebaseData';
+import logoUrl from '../assets/ist-logo.png?url';
 import {
   SearchIcon, CloseIcon, ResetFilterIcon, ImportIcon, WarningIcon,
 } from './Icons';
 
-function createEmptyRow(idx) {
-  return {
-    _id: `empty-${Date.now()}-${idx}`,
-    fullName: '', serial: '', idNumber: '', birthDate: '',
-    phone: '', email: '', rank: '', fullNameId: '', rank2: '',
-    courseCode: '', startDate: '', finishDate: '', note: '', date: '',
-  };
-}
-
-function getInitialState() {
-  const data = studentsData.map((r, i) => ({ ...r, _id: `reg-${i}` }));
-  for (let i = 0; i < 50; i++) data.push(createEmptyRow(i));
-  return data;
-}
-
 export default function SpreadsheetTable() {
-  const [rowData, setRowData] = useState(() => getInitialState());
+  const {
+    rows, loading, connected, syncError,
+    canUndo, canRedo,
+    updateCell, addRow, deleteRow, importRows, undo, redo,
+  } = useFirebaseData();
+
   const [searchText, setSearchText] = useState('');
   const [columnFilters, setColumnFilters] = useState({});
   const [menuState, setMenuState] = useState(null);
@@ -42,11 +29,10 @@ export default function SpreadsheetTable() {
   const [importOpen, setImportOpen] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(null);
   const gridRef = useRef(null);
-  const touchTimer = useRef(null);
-  const currentRef = useRef(rowData);
 
+  // Filter + search (unchanged logic, now backed by real-time rows).
   const filteredData = useMemo(() => {
-    let data = rowData;
+    let data = rows;
     const af = Object.entries(columnFilters);
     if (af.length > 0) {
       data = data.filter(row =>
@@ -59,125 +45,15 @@ export default function SpreadsheetTable() {
     if (searchText.trim()) {
       const q = searchText.toLowerCase().trim();
       data = data.filter(row =>
-        Object.values(row).some(v => String(v || '').toLowerCase().includes(q))
+        row && typeof row === 'object' && Object.values(row).some(v => String(v || '').toLowerCase().includes(q))
       );
     }
     return data;
-  }, [rowData, columnFilters, searchText]);
+  }, [rows, columnFilters, searchText]);
 
-  const onCellValueChanged = useCallback((event) => {
-    const { data, colDef, newValue } = event;
-    const field = colDef.field;
-    const newRows = currentRef.current.map(r => r._id === data._id ? { ...r, [field]: newValue ?? '' } : r);
-    currentRef.current = newRows; setRowData(newRows);
-  }, []);
-
-  const onContextMenu = useCallback((e) => {
-    e.preventDefault();
-    const gridApi = gridRef.current?.api;
-    if (!gridApi) return;
-    let rowIndex = -1;
-    const target = e.target.closest('.ag-row');
-    if (target) {
-      const rowNode = gridApi.getRowNode(target.getAttribute('row-id'));
-      if (rowNode) rowIndex = rowNode.rowIndex;
-    }
-    if (rowIndex === -1) {
-      const rect = gridRef.current?.eGridDiv?.getBoundingClientRect();
-      if (rect) rowIndex = Math.floor((e.clientY - rect.top) / 40);
-    }
-    const x = Math.min(e.clientX, window.innerWidth - 240);
-    const y = Math.min(e.clientY, window.innerHeight - 180);
-    setMenuState({ x, y, rowIndex: rowIndex >= 0 ? rowIndex : currentRef.current.length - 1 });
-  }, []);
-
-  const handleTouchStart = useCallback((e) => {
-    const touch = e.touches[0];
-    touchTimer.current = setTimeout(() => setMenuState({ x: 80, y: touch.clientY || 100, rowIndex: 0 }), 600);
-  }, []);
-
-  const handleTouchEnd = useCallback(() => { if (touchTimer.current) clearTimeout(touchTimer.current); }, []);
-
-  const insertRow = useCallback((position) => {
-    if (!menuState) return;
-    const empty = createEmptyRow(0);
-    const newRows = [...currentRef.current];
-    newRows.splice(position === 'above' ? menuState.rowIndex : menuState.rowIndex + 1, 0, empty);
-    currentRef.current = newRows; setRowData(newRows); setMenuState(null);
-  }, [menuState]);
-
-  // Open the delete confirmation dialog for a specific row index
-  const requestDelete = useCallback((rowIndex) => {
-    const api = gridRef.current?.api;
-    let row = null;
-    if (api) {
-      api.forEachNode(n => { if (n.rowIndex === rowIndex && !row) row = n.data; });
-    }
-    setConfirmDelete({
-      rowIndex,
-      name: row && row.fullName ? String(row.fullName) : '',
-    });
-  }, []);
-
-  const confirmDeleteRow = useCallback(() => {
-    if (!confirmDelete) return;
-    const newRows = [...currentRef.current];
-    if (confirmDelete.rowIndex >= 0 && confirmDelete.rowIndex < newRows.length) {
-      newRows.splice(confirmDelete.rowIndex, 1);
-      currentRef.current = newRows; setRowData(newRows);
-    }
-    setConfirmDelete(null);
-  }, [confirmDelete]);
-
-  const handleTrainingPlan = useCallback(() => {
-    setMenuState(null);
-    const groups = getUniqueCourseGroups(filteredData);
-    if (groups.length === 0) { alert('Filtrlənmiş məlumatda kurs tapılmadı.'); return; }
-    setFilteredForTemplate(filteredData); setModalGroups(groups); setModalOpen(true);
-  }, [filteredData]);
-
-  const handleConfirmTrainingPlan = useCallback(async (entries) => {
-    try {
-      const resp = await fetch(logoUrl);
-      const logoBuffer = await resp.arrayBuffer();
-      await generateTrainingPlan(filteredForTemplate, entries, logoBuffer);
-      setModalOpen(false);
-    } catch (err) {
-      console.error('Training Plan xətası:', err);
-      alert('Training Plan yaradılmasında xəta baş verdi.');
-    }
-  }, [filteredForTemplate]);
-
-  // Import: append only brand-new rows (dedup by key), preserving all existing data
-  const handleImportConfirm = useCallback((newRows) => {
-    if (!newRows || newRows.length === 0) return;
-    const existing = new Set(currentRef.current.map(r => rowKey(r)));
-    const added = newRows.filter(r => !existing.has(rowKey(r))).map((r, i) => ({ ...r, _id: `import-${Date.now()}-${i}` }));
-    if (added.length === 0) { setImportOpen(false); return; }
-    const merged = [...currentRef.current, ...added];
-    currentRef.current = merged; setRowData(merged);
-    setImportOpen(false);
-  }, []);
-
-  const handleFilterApply = useCallback((field, values) => {
-    setColumnFilters(prev => {
-      const next = { ...prev };
-      if (values && values.length > 0) next[field] = values; else delete next[field];
-      return next;
-    });
-    setActiveFilterColumn(null);
-  }, []);
-
-  const resetFilters = useCallback(() => {
-    setColumnFilters({});
-    setActiveFilterColumn(null);
-  }, []);
-
-  // Synchronized unique values: computed from data filtered by ALL OTHER columns
-  // (excluding the current field), so options cascade sequentially.
   const getSynchronizedValues = useCallback((field) => {
     const af = Object.entries(columnFilters).filter(([f]) => f !== field);
-    let data = rowData;
+    let data = rows;
     if (af.length > 0) {
       data = data.filter(row =>
         af.every(([f, vals]) => {
@@ -189,47 +65,137 @@ export default function SpreadsheetTable() {
     const vals = new Set();
     data.forEach(r => { const v = r[field]; if (v) vals.add(String(v)); });
     return Array.from(vals).sort();
-  }, [rowData, columnFilters]);
+  }, [rows, columnFilters]);
 
-  // Clicking a column header opens the filter directly (no extra button)
-  const handleHeaderClick = useCallback((event) => {
-    const colId = event.column?.getColId?.();
-    if (colId) setActiveFilterColumn(colId);
+  // Clicking a column header opens the filter directly (no extra button).
+  const handleHeaderClick = useCallback((field) => {
+    if (!field) return;
+    setActiveFilterColumn(field);
   }, []);
 
-  const makeCol = (field, cfg = {}) => ({
-    field,
-    headerName: FIELD_LABELS[field],
-    editable: true,
-    ...cfg,
-  });
+  // Map a filtered-row index back to its real index in the full dataset.
+  const realIndex = useCallback((filteredIdx) => {
+    const row = filteredData[filteredIdx];
+    if (!row) return -1;
+    return rows.indexOf(row);
+  }, [filteredData, rows]);
 
-  const columnDefs = useMemo(() => [
-    makeCol('fullName', { width: 260, minWidth: 150 }),
-    makeCol('serial', { width: 120, minWidth: 90 }),
-    makeCol('idNumber', { width: 130, minWidth: 100 }),
-    makeCol('birthDate', { width: 110, minWidth: 90 }),
-    makeCol('phone', { width: 175, minWidth: 120 }),
-    makeCol('email', { width: 260, minWidth: 180 }),
-    makeCol('rank', { width: 200, minWidth: 140 }),
-    makeCol('fullNameId', { width: 260, minWidth: 150 }),
-    makeCol('rank2', { width: 160, minWidth: 120 }),
-    makeCol('courseCode', { width: 110, minWidth: 80 }),
-    makeCol('startDate', { width: 130, minWidth: 100 }),
-    makeCol('finishDate', { width: 130, minWidth: 100 }),
-    makeCol('note', { width: 140, minWidth: 100 }),
-    makeCol('date', { width: 120, minWidth: 90 }),
-  ], []);
+  // ---- Context menu + row operations ----
 
-  const defaultColDef = useMemo(() => ({
-    sortable: false, resizable: true, filter: false, suppressMovable: true, suppressMenu: true,
-  }), []);
+  const handleRowContextMenu = useCallback((rowIndex, x, y) => {
+    setMenuState({ x, y, rowIndex });
+  }, []);
+
+  const insertRow = useCallback((position) => {
+    if (!menuState) return;
+    const idx = realIndex(menuState.rowIndex);
+    if (idx >= 0) addRow(position, idx);
+    setMenuState(null);
+  }, [menuState, realIndex, addRow]);
+
+  const requestDelete = useCallback((rowIndex) => {
+    const row = filteredData[rowIndex];
+    const actualIdx = row ? rows.indexOf(row) : rowIndex;
+    setConfirmDelete({ rowIndex: actualIdx, name: row?.fullName || '' });
+  }, [filteredData, rows]);
+
+  const confirmDeleteRow = useCallback(() => {
+    if (confirmDelete == null) return;
+    deleteRow(confirmDelete.rowIndex);
+    setConfirmDelete(null);
+  }, [confirmDelete, deleteRow]);
+
+  // ---- Training plan (unchanged) ----
+
+  const handleTrainingPlan = useCallback(() => {
+    if (menuState == null) return;
+    const groups = getUniqueCourseGroups(filteredData);
+    if (groups.length === 0) { setMenuState(null); return; }
+    setFilteredForTemplate(filteredData);
+    setModalGroups(groups);
+    setModalOpen(true);
+    setMenuState(null);
+  }, [menuState, filteredData]);
+
+  const handleConfirmTrainingPlan = useCallback(async (entries) => {
+    try {
+      const logoResp = await fetch(logoUrl);
+      const logoBuffer = await logoResp.arrayBuffer();
+      await generateTrainingPlan(filteredForTemplate, entries, logoBuffer);
+    } catch (err) {
+      console.error('Training plan error:', err);
+    }
+    setModalOpen(false);
+  }, [filteredForTemplate]);
+
+  // ---- Cell edit -> auto-save to Firebase ----
+  const handleCellEdit = useCallback((rowId, field, value) => {
+    updateCell(rowId, field, value);
+  }, [updateCell]);
+
+  // ---- Import confirm: write new + changed rows to Firebase ----
+  const handleImportConfirm = useCallback(({ added, updated }) => {
+    if ((!added || added.length === 0) && (!updated || updated.length === 0)) {
+      setImportOpen(false);
+      return;
+    }
+    const existing = new Set(rows.map(r => rowKey(r)));
+    const freshAdded = (added || []).filter(r => !existing.has(rowKey(r)));
+    if (freshAdded.length === 0 && (!updated || updated.length === 0)) { setImportOpen(false); return; }
+    importRows(freshAdded, updated || []);
+    setImportOpen(false);
+  }, [rows, importRows]);
+
+  // ---- Keyboard shortcuts: Undo / Redo (Ctrl+Z / Ctrl+Y) ----
+  useEffect(() => {
+    const handler = (e) => {
+      const target = e.target;
+      const inInput = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA');
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !inInput) {
+        e.preventDefault();
+        if (e.shiftKey) redo(); else undo();
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y' && !inInput) {
+        e.preventDefault();
+        redo();
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [undo, redo]);
+
+  if (loading) {
+    return (
+      <div className="spreadsheet-root">
+        <div className="loading-screen">
+          <div className="loading-spinner" />
+          <div className="loading-text">Məlumatlar yüklənir...</div>
+          <div className="loading-sub">Firebase bağlantısı qurulur</div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="spreadsheet-root">
       <div className="toolbar">
         <div className="toolbar-left">
-          <span className="row-count">{filteredData.length} / {rowData.length} sətir</span>
+          <span className="row-count">{filteredData.length} / {rows.length} sətir</span>
+          <button className={`btn-control ${canUndo ? '' : 'disabled'}`} onClick={undo} disabled={!canUndo} title="Geri al (Ctrl+Z)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="16" height="16" aria-hidden="true">
+              <polyline points="1 4 1 10 7 10" />
+              <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" />
+            </svg>
+          </button>
+          <button className={`btn-control ${canRedo ? '' : 'disabled'}`} onClick={redo} disabled={!canRedo} title="İrəli get (Ctrl+Y)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="16" height="16" aria-hidden="true">
+              <polyline points="23 4 23 10 17 10" />
+              <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+            </svg>
+          </button>
+          <span className={`sync-status ${connected ? 'online' : 'offline'}`} title={syncError || (connected ? 'Canlı' : 'Kəsildi')}>
+            <span className="sync-dot" />{connected ? 'Canlı' : 'Kəsildi'}
+          </span>
         </div>
 
         <div className="toolbar-center">
@@ -244,7 +210,7 @@ export default function SpreadsheetTable() {
           <div className="control-group">
             <button
               className={`btn-control reset ${Object.keys(columnFilters).length > 0 ? 'active' : ''}`}
-              onClick={resetFilters}
+              onClick={() => setColumnFilters({})}
               disabled={Object.keys(columnFilters).length === 0}
               title="Filtirləri sıfırla"
             >
@@ -270,28 +236,13 @@ export default function SpreadsheetTable() {
         </div>
       )}
 
-      <div className="ag-theme-quartz grid-wrap"
-        onContextMenu={onContextMenu}
-        onTouchStart={handleTouchStart}
-        onTouchEnd={handleTouchEnd}
-        onTouchMove={handleTouchEnd}
-      >
-        <AgGridReact
-          ref={gridRef}
-          rowData={filteredData}
-          columnDefs={columnDefs}
-          defaultColDef={defaultColDef}
-          modules={[ClientSideRowModelModule]}
-          enableCellTextSelection={true}
-          rowHeight={40}
-          headerHeight={44}
-          suppressRowHoverHighlight={false}
-          singleClickEdit={true}
-          onCellValueChanged={onCellValueChanged}
-          onColumnHeaderClicked={handleHeaderClick}
-          animateRows={false}
-        />
-      </div>
+      <ExcelGrid
+        ref={gridRef}
+        rows={filteredData}
+        onCellEdit={handleCellEdit}
+        onHeaderClick={handleHeaderClick}
+        onRowContextMenu={handleRowContextMenu}
+      />
 
       {menuState && (
         <ContextMenu
@@ -310,14 +261,22 @@ export default function SpreadsheetTable() {
           headerName={FIELD_LABELS[activeFilterColumn] || activeFilterColumn}
           values={getSynchronizedValues(activeFilterColumn)}
           selected={columnFilters[activeFilterColumn] || []}
-          onApply={handleFilterApply}
+          onApply={(field, values) => {
+            setColumnFilters(prev => {
+              const next = { ...prev };
+              if (values && values.length > 0) next[field] = values;
+              else delete next[field];
+              return next;
+            });
+            setActiveFilterColumn(null);
+          }}
           onClose={() => setActiveFilterColumn(null)}
         />
       )}
 
       {confirmDelete && (
         <div className="modal-overlay" onClick={() => setConfirmDelete(null)}>
-          <div className="modal confirm-modal" onClick={e => e.stopPropagation()}>
+          <div className="modal confirm-modal" onClick={(e) => e.stopPropagation()}>
             <div className="confirm-body">
               <div className="confirm-icon"><WarningIcon /></div>
               <div className="confirm-title">Sətir silinsin?</div>
@@ -345,7 +304,7 @@ export default function SpreadsheetTable() {
 
       {importOpen && (
         <ImportExcelModal
-          existingKeys={new Set(currentRef.current.map(r => rowKey(r)))}
+          existingRows={rows}
           onConfirm={handleImportConfirm}
           onCancel={() => setImportOpen(false)}
         />
